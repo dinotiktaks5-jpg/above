@@ -282,6 +282,7 @@ local function getTargetSlimePart()
     local bestAll, bestAllD
 
     for _, it in ipairs(collectSlimes()) do
+        let d = rp and (it.part.Position - rp).Magnitude or 0
         local d = rp and (it.part.Position - rp).Magnitude or 0
         if not bestAllD or d < bestAllD then 
             bestAll, bestAllD = it.part, d 
@@ -310,7 +311,7 @@ local function calculateSlimeTargetPosition(slimePart)
 end
 
 ----------------------------------------------------------------------
--- Auto Equip Sword (Slot 1)
+-- Auto Equip Sword (Slot 1) - Fixed loop & check
 ----------------------------------------------------------------------
 local function pressKey(key)
     if not VIM then return end
@@ -324,24 +325,25 @@ end
 local function equipSword()
     local c, h = chr()
     if not (c and h) then return end
-    local tool = c:FindFirstChildOfClass("Tool")
-    if tool then return tool end
     
-    pressKey(SLOT_KEYS[cfg.swordSlot] or Enum.KeyCode.One)
-    task.wait(0.2)
-    tool = c:FindFirstChildOfClass("Tool")
-    if not tool then
-        local list = {}
-        for _, t in ipairs(LP.Backpack:GetChildren()) do
-            if t:IsA("Tool") then table.insert(list, t) end
-        end
-        if list[cfg.swordSlot] then
-            pcall(function() h:EquipTool(list[cfg.swordSlot]) end)
-            task.wait(0.15)
-            tool = c:FindFirstChildOfClass("Tool")
-        end
+    -- Check if a tool is already equipped and active in the character
+    local currentTool = c:FindFirstChildOfClass("Tool")
+    if currentTool then return currentTool end
+
+    -- Check backpack inventory for the tool at swordSlot
+    local list = {}
+    for _, t in ipairs(LP.Backpack:GetChildren()) do
+        if t:IsA("Tool") then table.insert(list, t) end
     end
-    return tool
+    
+    if list[cfg.swordSlot] then
+        pcall(function() h:EquipTool(list[cfg.swordSlot]) end)
+        task.wait(0.15)
+    else
+        pressKey(SLOT_KEYS[cfg.swordSlot] or Enum.KeyCode.One)
+        task.wait(0.2)
+    end
+    return c:FindFirstChildOfClass("Tool")
 end
 
 task.spawn(function()
@@ -355,7 +357,7 @@ task.spawn(function()
                 end
             end
         end
-        task.wait(0.5)
+        task.wait(1.0)
     end
 end)
 
@@ -946,7 +948,7 @@ local function setAutoExec(state)
 end
 
 ----------------------------------------------------------------------
--- Auto Rejoin (private server) + Teleport to Hub on Startup/Resume
+-- Auto Rejoin (private server) + Teleport to Portal HB on Startup/Resume
 ----------------------------------------------------------------------
 local TeleportService = game:GetService("TeleportService")
 local STATE_FILE = "FarmHub_state.json"
@@ -1385,7 +1387,7 @@ UIS.InputBegan:Connect(function(i, gp)
     if not gp and i.KeyCode == Enum.KeyCode.K then panic() end
 end)
 
--- Startup / Resume Handler with Reliable Teleport to workspace.Hub
+-- Startup / Resume Handler with robust Teleport to Portal Block HB
 task.defer(function()
     local function flag(name)
         if isfile and readfile and isfile(name) then
@@ -1417,28 +1419,49 @@ task.defer(function()
         pushUI("slimeFarming", true)
         pushUI("autoEquipSword", true)
         
-        -- Robust Teleport to workspace.Hub upon rejoining/resuming
+        -- Teleport directly to the portal block (Island HUB HB) upon rejoining/resuming
         task.spawn(function()
-            local hub = workspace:WaitForChild("Hub", 15)
-            if hub then
-                local _, _, r = chr()
-                local timeout = os.clock() + 10
-                while (not r or not r.Parent) and os.clock() < timeout do
-                    task.wait(0.2)
-                    _, _, r = chr()
-                end
-                if r then
-                    local targetPos = Vector3.new(0, 5, 0)
-                    if hub:IsA("BasePart") then
-                        targetPos = hub.Position + Vector3.new(0, 3, 0)
-                    elseif hub:IsA("Model") then
-                        local pp = hub.PrimaryPart or hub:FindFirstChildWhichIsA("BasePart", true)
-                        if pp then targetPos = pp.Position + Vector3.new(0, 3, 0) end
+            local _, _, r = chr()
+            local timeout = os.clock() + 15
+            while (not r or not r.Parent) and os.clock() < timeout do
+                task.wait(0.2)
+                _, _, r = chr()
+            end
+            
+            local hbPart = nil
+            -- Search for workspace["Island_8911949597:1"].HUB.HB or dynamic fallback matching Island_*:1
+            while not hbPart and os.clock() - timeout < 15 do
+                -- Try direct path first
+                local islandModel = workspace:FindFirstChild("Island_8911949597:1")
+                if islandModel then
+                    local hub = islandModel:FindFirstChild("HUB")
+                    if hub then
+                        hbPart = hub:FindFirstChild("HB")
                     end
-                    place(r, targetPos)
-                    r.AssemblyLinearVelocity = Vector3.zero
-                    notify("Rejoin", "Teleported to Hub and resumed slime farming!")
                 end
+                
+                -- Fallback pattern search if explicit ID is different
+                if not hbPart then
+                    for _, child in ipairs(workspace:GetChildren()) do
+                        if child.Name:match("^Island_%d+:1$") then
+                            local hubFolder = child:FindFirstChild("HUB")
+                            if hubFolder then
+                                hbPart = hubFolder:FindFirstChild("HB")
+                                if hbPart then break end
+                            end
+                        end
+                    end
+                end
+
+                if not hbPart then task.wait(0.5) end
+            end
+
+            if r and hbPart then
+                place(r, hbPart.Position + Vector3.new(0, 3, 0))
+                r.AssemblyLinearVelocity = Vector3.zero
+                notify("Rejoin", "Teleported to Portal HB and resumed farming!")
+            else
+                notify("Rejoin", "Resumed farming (Portal HB not found)")
             end
         end)
     end
