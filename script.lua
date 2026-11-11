@@ -40,9 +40,8 @@ local cfg = {
     wsIdx = 1,
     
     -- Slime Farm Config
-    slimeSelection = { Pink = true, Orange = true, Blue = true, Green = true },
     skipAfter = 15,         -- give up on a target that isn't taking damage after this many seconds (0 = off)
-    farmAll = false,        -- Targets every slime under workspace.Hub.Guardians (nearest first)
+    farmAll = true,         -- Targets every slime under workspace.Hub.Guardians (nearest first)
     rejoinOnClear = false,  -- rejoin the private server once every slime is dead
     privateLink = "",       -- private server link
     rejoinMethod = "Teleport", -- Teleport | Open Link
@@ -54,11 +53,15 @@ local cfg = {
     slimeSpeed = 35,        -- Speed for slime movement/tweens
     
     -- Auto M1 (independent of slime farm)
-    autoM1 = false,
+    autoM1 = true,
     m1Delay = 0.1,          -- Delay between swings (s)
     chargeM1 = false,       -- Hold M1 then release (bows)
     chargeTime = 1.0,       -- How long to hold M1 when charging (s)
     
+    -- Auto Equip Sword (Slot 1)
+    autoEquipSword = true,
+    swordSlot = 1,
+
     -- Auto Load / Auto Execute
     autoLoad = true,        -- load the saved config automatically on startup
     autoExec = false,
@@ -73,6 +76,10 @@ local cfg = {
     breakTimeout = 3,       
 }
 local SPEEDS = { 16, 25, 35, 50, 75, 100 }
+local SLOT_KEYS = {
+    Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four, Enum.KeyCode.Five,
+    Enum.KeyCode.Six, Enum.KeyCode.Seven, Enum.KeyCode.Eight, Enum.KeyCode.Nine,
+}
 local FILE = "FarmHubConfig.json"
 
 local function chr()
@@ -92,7 +99,7 @@ local function getZone()
     z.sx, z.sz = z.maxX - z.minX, z.maxZ - z.minZ
     local v = cfg.axis == "Vertical"
     z.laneMin, z.laneMax = v and z.minX or z.minZ, v and z.maxX or z.maxZ
-    z.alongMin, z.alongMax = v and z.minZ or z.minX, v and z.maxZ or z.maxX
+    z.alongMin, z.alongMax = v and z.minZ or z.minX, v and z.maxZ or z.alongMax
     z.count = math.max(1, math.ceil((z.laneMax - z.laneMin) / cfg.laneWidth - 1e-6))
     return z
 end
@@ -194,8 +201,6 @@ end
 
 ----------------------------------------------------------------------
 -- Slime Target Resolver
--- Farm All  -> every child of workspace.Hub.Guardians, nearest first
--- Otherwise -> Pink > Orange > Blue
 ----------------------------------------------------------------------
 local function partFrom(inst)
     if not inst then return nil end
@@ -218,18 +223,8 @@ local function getGuardians()
     return hub and hub:FindFirstChild("Guardians")
 end
 
-local SLIME_PRIORITY = { "Pink", "Orange", "Blue", "Green" }
+local slimeBlacklist = {}
 
-local function slimeKind(name)
-    local l = name:lower()
-    for _, k in ipairs(SLIME_PRIORITY) do
-        if l:find(k:lower(), 1, true) then return k end
-    end
-end
-
-local slimeBlacklist = {}   -- part -> time until which it is ignored (stuck / unkillable targets)
-
--- Reads the health bar fill so we can tell whether a target is actually taking damage
 local function healthSig(part)
     local g = part and part:FindFirstChild("Health")
     local bar = g and g:FindFirstChild("Bar")
@@ -237,8 +232,6 @@ local function healthSig(part)
     return 0
 end
 
--- A slime is dead when its Health billboard is disabled or its meshes are fully invisible
--- (dead ones stay parked at their spawn point / underground until they respawn).
 local function slimeAlive(child)
     local hp = child:FindFirstChild("Health")
     if hp and hp:IsA("BillboardGui") and not hp.Enabled then return false end
@@ -251,8 +244,6 @@ local function slimeAlive(child)
     return true
 end
 
--- Every slime is a Part directly under Hub.Guardians (PinkSlime / BlueSlime / GreenSlime ...).
--- Dead ones and recently blacklisted (stuck) ones are skipped.
 local function collectSlimes(ignoreBlacklist)
     local g = getGuardians()
     if not g then return {} end
@@ -262,20 +253,18 @@ local function collectSlimes(ignoreBlacklist)
         local part = partFrom(child)
         if part and part.Parent and not isDead(child) and slimeAlive(child)
             and (ignoreBlacklist or not (slimeBlacklist[part] and slimeBlacklist[part] > now)) then
-            table.insert(out, { inst = child, part = part, kind = slimeKind(child.Name) })
+            table.insert(out, { inst = child, part = part })
         end
     end
     return out
 end
 
--- total = slimes matching your target settings that exist right now, alive = how many are alive
 local function slimeCensus()
     local g = getGuardians()
     if not g then return 0, 0 end
     local total, alive = 0, 0
     for _, child in ipairs(g:GetChildren()) do
-        local kind = slimeKind(child.Name)
-        if partFrom(child) and (cfg.farmAll or (kind and cfg.slimeSelection[kind])) then
+        if partFrom(child) then
             total += 1
             if slimeAlive(child) and not isDead(child) then alive += 1 end
         end
@@ -284,74 +273,22 @@ local function slimeCensus()
 end
 
 local function countFarmTargets()
-    local n = 0
-    for _, it in ipairs(collectSlimes()) do
-        if cfg.farmAll or (it.kind and cfg.slimeSelection[it.kind]) then n += 1 end
-    end
-    return n
+    return #collectSlimes()
 end
 
--- Debug: copies the Guardians hierarchy so the exact layout can be checked
-local function dumpGuardians()
-    local g = getGuardians()
-    if not g then
-        WindUI:Notify({ Title = "Debug", Content = "workspace.Hub.Guardians not found", Duration = 3 })
-        return
-    end
-    local lines, count = {}, 0
-    local function walk(inst, depth)
-        if depth > 5 then return end
-        for i, c in ipairs(inst:GetChildren()) do
-            if count >= 400 then return end
-            count += 1
-            local extra = ""
-            if c:IsA("BasePart") then
-                extra = " pos=" .. tostring(c.Position) .. " transp=" .. tostring(c.Transparency)
-                    .. " anchored=" .. tostring(c.Anchored) .. " canCollide=" .. tostring(c.CanCollide)
-            end
-            if c:IsA("BillboardGui") then extra = " enabled=" .. tostring(c.Enabled) end
-            if c:IsA("GuiObject") then extra = " size=" .. tostring(c.Size) .. " visible=" .. tostring(c.Visible) end
-            if c:IsA("Humanoid") then extra = " hp=" .. tostring(c.Health) end
-            table.insert(lines, string.rep("  ", depth) .. "[" .. i .. "] " .. c.Name .. " (" .. c.ClassName .. ")" .. extra)
-            walk(c, depth + 1)
-        end
-    end
-    walk(g, 0)
-    if count >= 400 then table.insert(lines, "... truncated at 400 entries") end
-    local text = "workspace.Hub.Guardians\n" .. table.concat(lines, "\n")
-    print(text)
-    local copied = false
-    if setclipboard then copied = pcall(setclipboard, text) end
-    WindUI:Notify({
-        Title = "Debug",
-        Content = copied and ("Copied " .. count .. " entries to clipboard") or ("Printed " .. count .. " entries to console (F9)"),
-        Duration = 3,
-    })
-end
-
--- Farm All: nearest slime of any kind.
--- Otherwise: Pink > Orange > Blue > Green, nearest slime within the first enabled kind.
 local function getTargetSlimePart()
     local _, _, r = chr()
     local rp = r and r.Position
     local bestAll, bestAllD
-    local bestKind = {}
 
     for _, it in ipairs(collectSlimes()) do
         local d = rp and (it.part.Position - rp).Magnitude or 0
-        if cfg.farmAll then
-            if not bestAllD or d < bestAllD then bestAll, bestAllD = it.part, d end
-        elseif it.kind and cfg.slimeSelection[it.kind] then
-            local cur = bestKind[it.kind]
-            if not cur or d < cur.d then bestKind[it.kind] = { part = it.part, d = d } end
+        if not bestAllD or d < bestAllD then 
+            bestAll, bestAllD = it.part, d 
         end
     end
 
-    if cfg.farmAll then return bestAll end
-    for _, k in ipairs(SLIME_PRIORITY) do
-        if bestKind[k] then return bestKind[k].part end
-    end
-    return nil
+    return bestAll
 end
 
 local function calculateSlimeTargetPosition(slimePart)
@@ -371,6 +308,56 @@ local function calculateSlimeTargetPosition(slimePart)
     end
     return pos + Vector3.new(0, offset, 0)
 end
+
+----------------------------------------------------------------------
+-- Auto Equip Sword (Slot 1)
+----------------------------------------------------------------------
+local function pressKey(key)
+    if not VIM then return end
+    pcall(function()
+        VIM:SendKeyEvent(true, key, false, game)
+        task.wait(0.05)
+        VIM:SendKeyEvent(false, key, false, game)
+    end)
+end
+
+local function equipSword()
+    local c, h = chr()
+    if not (c and h) then return end
+    local tool = c:FindFirstChildOfClass("Tool")
+    if tool then return tool end
+    
+    pressKey(SLOT_KEYS[cfg.swordSlot] or Enum.KeyCode.One)
+    task.wait(0.2)
+    tool = c:FindFirstChildOfClass("Tool")
+    if not tool then
+        local list = {}
+        for _, t in ipairs(LP.Backpack:GetChildren()) do
+            if t:IsA("Tool") then table.insert(list, t) end
+        end
+        if list[cfg.swordSlot] then
+            pcall(function() h:EquipTool(list[cfg.swordSlot]) end)
+            task.wait(0.15)
+            tool = c:FindFirstChildOfClass("Tool")
+        end
+    end
+    return tool
+end
+
+task.spawn(function()
+    while S.alive do
+        if cfg.autoEquipSword and S.slimeFarming then
+            local c, h = chr()
+            if h and h.Health > 0 then
+                local tool = c and c:FindFirstChildOfClass("Tool")
+                if not tool then
+                    equipSword()
+                end
+            end
+        end
+        task.wait(0.5)
+    end
+end)
 
 ----------------------------------------------------------------------
 -- Farming Loops & Auto M1 (Swing)
@@ -419,7 +406,6 @@ local function farmLane()
     end
 end
 
--- Walk To: humanoid:MoveTo plus automatic jumping over obstacles / when stuck
 local walkState = { pos = nil, t = 0, lastJump = 0 }
 
 local function walkStep(h, r, dest)
@@ -441,7 +427,6 @@ local function walkStep(h, r, dest)
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = ignore
 
-    -- something solid right in front of our feet / knees -> hop over it
     for _, dy in ipairs({ -1.5, 0 }) do
         local hit = workspace:Raycast(r.Position + Vector3.new(0, dy, 0), dir * 4, params)
         if hit and hit.Instance.CanCollide then
@@ -450,7 +435,6 @@ local function walkStep(h, r, dest)
         end
     end
 
-    -- barely moved for 0.6s while we still have somewhere to go -> jump
     local flatPos = Vector3.new(r.Position.X, 0, r.Position.Z)
     if walkState.pos == nil or now - walkState.t > 0.6 then
         if walkState.pos and (flatPos - walkState.pos).Magnitude < 0.8 then jump = true end
@@ -529,10 +513,8 @@ local function notify(title, content)
 end
 
 ----------------------------------------------------------------------
--- Auto M1 (separate from slime farm) + Charge M1 for bows
+-- Auto M1 + Charge M1 for bows
 ----------------------------------------------------------------------
--- Real left click through VirtualInputManager, sent on the right side of the screen
--- so it doesn't land on the menu.
 local function m1Pos()
     local cam = workspace.CurrentCamera
     local vs = cam and cam.ViewportSize or Vector2.new(800, 600)
@@ -562,7 +544,6 @@ task.spawn(function()
             if h and h.Health > 0 then
                 m1Down()
                 if cfg.chargeM1 then
-                    -- hold to charge (stops early if toggled off), then release to fire
                     local t0 = os.clock()
                     while cfg.autoM1 and S.alive and os.clock() - t0 < cfg.chargeTime do
                         task.wait(0.05)
@@ -665,10 +646,6 @@ local bbFolder = Instance.new("Folder")
 bbFolder.Name = "BreakerPreview"
 bbFolder.Parent = workspace
 
-local SLOT_KEYS = {
-    Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four, Enum.KeyCode.Five,
-    Enum.KeyCode.Six, Enum.KeyCode.Seven, Enum.KeyCode.Eight, Enum.KeyCode.Nine,
-}
 local MAX_HIGHLIGHTS = 500
 
 local function bbBox()
@@ -738,15 +715,6 @@ end
 local function breakerZoneChanged()
     BB.skip = {}
     rebuildBreaker()
-end
-
-local function pressKey(key)
-    if not VIM then return end
-    pcall(function()
-        VIM:SendKeyEvent(true, key, false, game)
-        task.wait(0.05)
-        VIM:SendKeyEvent(false, key, false, game)
-    end)
 end
 
 local function equipPick(force)
@@ -882,9 +850,8 @@ end)
 ----------------------------------------------------------------------
 -- Save / Load Config, Auto Execute
 ----------------------------------------------------------------------
-local UIEl = {}      -- key -> { el = element, kind = "toggle" | "slider" | "dropdown" | "input" }
-local syncUI         -- assigned after the UI is built
-
+local UIEl = {}
+local syncUI
 
 local function saveConfig(silent)
     if not writefile then notify("Config", "Your executor doesn't support writefile") return end
@@ -921,12 +888,8 @@ local function loadConfig(silent)
         end
     end
     cfg.autoLoad = keepAutoLoad
-    -- never start swinging / farming just because of a saved file
-    cfg.autoM1 = false
-    cfg.farmAll = false
-    for _, k in ipairs(SLIME_PRIORITY) do
-        if cfg.slimeSelection[k] == nil then cfg.slimeSelection[k] = true end
-    end
+    cfg.autoM1 = true
+    cfg.autoEquipSword = true
     if type(data.bb) == "table" then
         local b = data.bb
         BB.c1 = b.c1 and Vector3.new(b.c1[1], b.c1[2], b.c1[3]) or nil
@@ -940,9 +903,6 @@ local function loadConfig(silent)
     return true
 end
 
--- Auto Execute: re-runs this script after every teleport / server hop.
--- Needs queue_on_teleport plus a way to re-fetch the script: either a Script URL
--- (raw link) or this script saved as FarmHub.lua in the executor's workspace folder.
 local AUTOEXEC_FLAG = "FarmHub_autoexec.txt"
 local AUTOLOAD_FLAG = "FarmHub_autoload.txt"
 local SCRIPT_FILE = "FarmHub.lua"
@@ -986,12 +946,8 @@ local function setAutoExec(state)
 end
 
 ----------------------------------------------------------------------
--- Auto Rejoin (private server) + resume farming
+-- Auto Rejoin (private server) + Teleport to Hub on Startup/Resume
 ----------------------------------------------------------------------
--- Roblox has no script API to join a VIP server from a link. So "Teleport" relies on
--- TeleportService:Teleport(placeId): Roblox documents that a plain teleport returns you
--- to the VIP server you recently joined. "Open Link" opens the link in your browser,
--- which launches a fresh Roblox client (your executor's autoexec must start the script).
 local TeleportService = game:GetService("TeleportService")
 local STATE_FILE = "FarmHub_state.json"
 
@@ -1029,8 +985,8 @@ local function rejoinServer(manual)
     S.lastRejoin = os.time()
 
     saveConfig(true)
-    writeState({ resume = true, farmAll = cfg.farmAll, autoM1 = cfg.autoM1, lastRejoin = S.lastRejoin })
-    setAutoExec(true) -- the script has to re-run in the new server to keep farming
+    writeState({ resume = true, autoM1 = cfg.autoM1, autoEquipSword = cfg.autoEquipSword, lastRejoin = S.lastRejoin })
+    setAutoExec(true)
 
     notify("Rejoin", manual and "Rejoining..." or "All slimes cleared - rejoining...")
     m1Up()
@@ -1060,7 +1016,6 @@ local function rejoinServer(manual)
     end)
 end
 
--- Watcher: every targeted slime exists but is dead for a while -> rejoin
 task.spawn(function()
     local startedAt = os.clock()
     local clearedSince
@@ -1110,7 +1065,6 @@ local TabBuilding = Window:Tab({ Title = "Building", Icon = "hammer" })
 
 TabFarm:Select()
 
--- Helpers that build an element AND remember it, so loading a config can refresh it
 local function sliderEl(tab, key, title, min, max, step, onChange)
     UIEl[key] = { kind = "slider", el = tab:Slider({
         Title = title,
@@ -1182,7 +1136,7 @@ TabFarm:Button({
 ----------------------------------------------------------------------
 UIEl.slimeFarming = { kind = "toggle", el = TabSlime:Toggle({
     Title = "Slime Farm Status",
-    Desc = "Moves to slimes. Turn on Auto M1 in the Combat tab to attack",
+    Desc = "Moves to slimes under workspace.Hub.Guardians",
     Value = false,
     Callback = function(state)
         S.slimeFarming = state
@@ -1190,14 +1144,12 @@ UIEl.slimeFarming = { kind = "toggle", el = TabSlime:Toggle({
         local msg = state and "Started" or "Stopped"
         if state then
             local n = countFarmTargets()
-            msg = n > 0 and ("Started - " .. n .. " targets found") or "Started - NO targets found (check target toggles / Farm All)"
+            msg = n > 0 and ("Started - " .. n .. " targets found") or "Started - NO targets found"
         end
         WindUI:Notify({ Title = "Slime Farm", Content = msg, Duration = 3 })
     end
 }) }
 
-toggleEl(TabSlime, "farmAll", "Farm All",
-    "Targets every slime under Hub.Guardians (all colors), nearest first. Overrides the toggles below")
 sliderEl(TabSlime, "skipAfter", "Skip Stuck Target After (s)", 0, 60, 1)
 
 TabSlime:Section({ Title = "Auto Rejoin (private server)" })
@@ -1207,7 +1159,7 @@ toggleEl(TabSlime, "rejoinOnClear", "Rejoin When All Slimes Are Dead",
 
 UIEl.privateLink = { kind = "input", el = TabSlime:Input({
     Title = "Private Server Link",
-    Desc = "Your private server link (used by 'Open Link' and as the fallback)",
+    Desc = "Your private server link",
     Value = cfg.privateLink,
     Placeholder = "https://www.roblox.com/games/...?privateServerLinkCode=...",
     Callback = function(text)
@@ -1228,22 +1180,28 @@ TabSlime:Button({
 
 TabSlime:Paragraph({
     Title = "How it works",
-    Desc = "Teleport sends you back to the private server you're in (Roblox returns you to a VIP server you recently joined). Open Link launches a new client from your link - your executor's autoexec must start the script there. Join your private server through the link once first.",
+    Desc = "Teleport sends you back to the private server you're in.",
 })
 
 ----------------------------------------------------------------------
--- Combat Tab (Auto M1 / Charge M1)
+-- Combat Tab (Auto M1 / Charge M1 / Auto Equip Sword)
 ----------------------------------------------------------------------
 toggleEl(TabCombat, "autoM1", "Auto M1",
-    "Swings your equipped tool. Works on its own. Panic key: K turns everything off",
+    "Swings your equipped tool. Panic key: K turns everything off",
     function(state) if not state then m1Up() end end)
 
 toggleEl(TabCombat, "chargeM1", "Charge M1 (Bows)", "Auto M1 holds to charge, then releases to fire")
 sliderEl(TabCombat, "chargeTime", "Charge Time (s)", 0.1, 5, 0.1)
 sliderEl(TabCombat, "m1Delay", "M1 Delay (s)", 0.05, 1, 0.05)
+
+toggleEl(TabCombat, "autoEquipSword", "Auto Equip Sword", "Automatically equips weapon/tool from slot 1 when farming slimes")
+sliderEl(TabCombat, "swordSlot", "Sword Hotbar Slot", 1, 9, 1, function(v)
+    cfg.swordSlot = math.floor(v)
+end)
+
 TabCombat:Paragraph({
     Title = "Note",
-    Desc = "Auto M1 sends real clicks on the right side of the screen. If the menu is ever in the way, press K to stop everything.",
+    Desc = "Auto M1 sends real clicks on the right side of the screen. Press K to stop everything.",
 })
 
 ----------------------------------------------------------------------
@@ -1309,13 +1267,13 @@ TabConfig:Section({ Title = "Save / Load" })
 
 TabConfig:Button({
     Title = "Save Config",
-    Desc = "Saves all settings, zones and block breaker area to " .. FILE,
+    Desc = "Saves all settings to " .. FILE,
     Callback = function() saveConfig(false) end
 })
 
 TabConfig:Button({
     Title = "Load Config",
-    Desc = "Loads the saved file and refreshes every setting",
+    Desc = "Loads the saved file",
     Callback = function() loadConfig(false) end
 })
 
@@ -1328,12 +1286,12 @@ toggleEl(TabConfig, "autoLoad", "Auto Load Config",
 TabConfig:Section({ Title = "Auto Execute" })
 
 toggleEl(TabConfig, "autoExec", "Auto Execute",
-    "Re-runs this script after teleports / server hops (needs queue_on_teleport)",
+    "Re-runs this script after teleports",
     function(state) setAutoExec(state) end)
 
 UIEl.scriptUrl = { kind = "input", el = TabConfig:Input({
     Title = "Script URL (raw link)",
-    Desc = "Where to re-download the script from. Leave empty to use " .. SCRIPT_FILE .. " from your workspace folder",
+    Desc = "Where to re-download the script from",
     Value = cfg.scriptUrl,
     Placeholder = "https://raw.githubusercontent.com/...",
     Callback = function(text)
@@ -1393,7 +1351,6 @@ UIEl.bbRunning = { kind = "toggle", el = TabBuilding:Toggle({
     end
 }) }
 
--- Refresh every element from cfg (used after Load Config)
 local function pushUI(key, value)
     local u = UIEl[key]
     if not u then return end
@@ -1408,17 +1365,15 @@ syncUI = function()
     for key, u in pairs(UIEl) do
         if key == "wsIdx" then
             pushUI(key, tostring(SPEEDS[cfg.wsIdx]))
-        elseif key:sub(1, 3) == "sel" and cfg.slimeSelection[key:sub(4)] ~= nil then
-            pushUI(key, cfg.slimeSelection[key:sub(4)])
         elseif cfg[key] ~= nil then
             pushUI(key, cfg[key])
         end
     end
 end
 
--- Panic key: K stops Auto M1 and all farming instantly
+-- Keybind K: Stops everything instantly (Emergency Keybind)
 local function panic()
-    cfg.autoM1, cfg.farmAll = false, false
+    cfg.autoM1 = false
     S.slimeFarming, S.farming = false, false
     BB.running, BB.target = false, nil
     m1Up()
@@ -1430,7 +1385,7 @@ UIS.InputBegan:Connect(function(i, gp)
     if not gp and i.KeyCode == Enum.KeyCode.K then panic() end
 end)
 
--- Startup: auto load config, re-arm auto execute, resume farming after a rejoin
+-- Startup / Resume Handler with Reliable Teleport to workspace.Hub
 task.defer(function()
     local function flag(name)
         if isfile and readfile and isfile(name) then
@@ -1443,8 +1398,6 @@ task.defer(function()
     S.lastRejoin = state.lastRejoin or 0
     local resuming = state.resume == true
 
-    -- the switch lives in its own tiny file (the config itself can't say whether to load it);
-    -- a rejoin always loads the config so your settings carry over
     local autoLoadOn = flag(AUTOLOAD_FLAG) ~= "0"
     if autoLoadOn or resuming then
         if loadConfig(true) and not resuming then notify("Config", "Auto-loaded saved config") end
@@ -1452,19 +1405,42 @@ task.defer(function()
     cfg.autoLoad = autoLoadOn
     pushUI("autoLoad", autoLoadOn)
 
-    -- keep auto execute armed across teleports even if the config wasn't loaded
     if flag(AUTOEXEC_FLAG) == "1" then cfg.autoExec = true end
     if cfg.autoExec then setAutoExec(true) end
 
     if resuming then
         writeState({ resume = false, lastRejoin = S.lastRejoin })
-        cfg.farmAll = state.farmAll == true
-        cfg.autoM1 = state.autoM1 == true
+        cfg.autoM1 = true
+        cfg.autoEquipSword = true
         S.slimeFarming, S.farming = true, true
-        pushUI("farmAll", cfg.farmAll)
-        pushUI("autoM1", cfg.autoM1)
+        pushUI("autoM1", true)
         pushUI("slimeFarming", true)
-        notify("Rejoin", "Resumed farming after rejoin")
+        pushUI("autoEquipSword", true)
+        
+        -- Robust Teleport to workspace.Hub upon rejoining/resuming
+        task.spawn(function()
+            local hub = workspace:WaitForChild("Hub", 15)
+            if hub then
+                local _, _, r = chr()
+                local timeout = os.clock() + 10
+                while (not r or not r.Parent) and os.clock() < timeout do
+                    task.wait(0.2)
+                    _, _, r = chr()
+                end
+                if r then
+                    local targetPos = Vector3.new(0, 5, 0)
+                    if hub:IsA("BasePart") then
+                        targetPos = hub.Position + Vector3.new(0, 3, 0)
+                    elseif hub:IsA("Model") then
+                        local pp = hub.PrimaryPart or hub:FindFirstChildWhichIsA("BasePart", true)
+                        if pp then targetPos = pp.Position + Vector3.new(0, 3, 0) end
+                    end
+                    place(r, targetPos)
+                    r.AssemblyLinearVelocity = Vector3.zero
+                    notify("Rejoin", "Teleported to Hub and resumed slime farming!")
+                end
+            end
+        end)
     end
 end)
 
@@ -1496,9 +1472,9 @@ local inputConn = UIS.InputBegan:Connect(function(i, gp)
                 breakerZoneChanged()
             elseif picked == 4 then
                 BB.c2 = res.Position
-                local y = math.floor(res.Position.Y + 0.5)
-                BB.yMin = BB.yMin or y
-                BB.yMax = y
+                local yCoord = math.floor(res.Position.Y + 0.5)
+                BB.yMin = BB.yMin or yCoord
+                BB.yMax = yCoord
                 breakerZoneChanged()
             end
             WindUI:Notify({Title = "Success", Content = "Corner " .. picked .. " set successfully!", Duration = 2})
