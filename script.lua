@@ -1,3 +1,8 @@
+--[[
+    FarmHub - Lane Farming, Multi-Slime Farming, & Block Breaker Script
+    UI Library: WindUI
+]]
+
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
@@ -277,7 +282,6 @@ local function getTargetSlimePart()
     local bestAll, bestAllD
 
     for _, it in ipairs(collectSlimes()) do
-        let d = rp and (it.part.Position - rp).Magnitude or 0
         local d = rp and (it.part.Position - rp).Magnitude or 0
         if not bestAllD or d < bestAllD then 
             bestAll, bestAllD = it.part, d 
@@ -1424,9 +1428,7 @@ task.defer(function()
             end
             
             local hbPart = nil
-            -- Search for workspace["Island_8911949597:1"].HUB.HB or dynamic fallback matching Island_*:1
             while not hbPart and os.clock() - timeout < 15 do
-                -- Try direct path first
                 local islandModel = workspace:FindFirstChild("Island_8911949597:1")
                 if islandModel then
                     local hub = islandModel:FindFirstChild("HUB")
@@ -1435,7 +1437,6 @@ task.defer(function()
                     end
                 end
                 
-                -- Fallback pattern search if explicit ID is different
                 if not hbPart then
                     for _, child in ipairs(workspace:GetChildren()) do
                         if child.Name:match("^Island_%d+:1$") then
@@ -1495,7 +1496,7 @@ local inputConn = UIS.InputBegan:Connect(function(i, gp)
                 BB.yMax = yCoord
                 breakerZoneChanged()
             end
-            WindUI:Notify({Title = "Success", Content = "Corner " .. picked .. " set successfully!", Duration = 2})
+            WindUI:Notify({Title = "Success", Content = "Corner " .. picked .. " set successfully!", Duration=2})
             S.picking = nil
         end
     end
