@@ -1,8 +1,3 @@
---[[
-    FarmHub - Lane Farming, Multi-Slime Farming, & Block Breaker Script
-    UI Library: WindUI
-]]
-
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
