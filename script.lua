@@ -21,6 +21,7 @@ local TweenService    = game:GetService("TweenService")
 local UIS             = game:GetService("UserInputService")
 local HttpService     = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
+local PathfindingService = game:GetService("PathfindingService")
 
 local LP = Players.LocalPlayer
 
@@ -536,8 +537,112 @@ local function tweenTo(r, item, dest)
     if activeTween == tween then activeTween = nil end
 end
 
+-- WALK TO: real pathfinding. Paths to the ground next to the slime, follows
+-- waypoints, jumps where the path says so, and repaths / gives up when stuck.
+local floorParams = RaycastParams.new()
+floorParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function groundAt(pos)
+    local ignore = { LP.Character }
+    local g = getGuardians()
+    if g then table.insert(ignore, g) end
+    floorParams.FilterDescendantsInstances = ignore
+    local res = workspace:Raycast(pos + Vector3.new(0, 4, 0), Vector3.new(0, -80, 0), floorParams)
+    return res and res.Position or pos
+end
+
+local function flatDist(a, b)
+    return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
+end
+
+-- Where to stand on the ground next to the slime. Above/Below can't be walked,
+-- so they just approach from the side we're coming from.
+local function walkGoal(part, r)
+    local base = part.Position
+    local m = cfg.slimeMode
+    local dir
+    if m == "Infront" then
+        dir = part.CFrame.LookVector
+    elseif m == "Behind" then
+        dir = -part.CFrame.LookVector
+    else
+        dir = Vector3.new(r.Position.X - base.X, 0, r.Position.Z - base.Z)
+    end
+    dir = Vector3.new(dir.X, 0, dir.Z)
+    dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(0, 0, 1)
+    local d = (m == "Infront" or m == "Behind") and math.max(cfg.slimeOffset, 3) or 3.5
+    return groundAt(base + dir * d)
+end
+
+local function walkActive()
+    return S.alive and S.farming and not S.pinkFarm and not S.rejoining
+end
+
+-- Walks to one waypoint. Returns "ok", "stop", "repath" or "stuck"
+local function stepToWaypoint(h, r, item, wp, slimeStart, isBlocked)
+    h:MoveTo(wp.Position)
+    local started = os.clock()
+    local lastCheck, lastPos = started, r.Position
+    local timeout = math.max(3, flatDist(r.Position, wp.Position) / math.max(h.WalkSpeed * 0.6, 4) + 2)
+
+    while true do
+        RunService.Heartbeat:Wait()
+        if not walkActive() or h.Health <= 0 or not validTarget(item) then return "stop" end
+        if flatDist(r.Position, wp.Position) <= 2.5 then return "ok" end
+        if isBlocked() then return "repath" end
+        if (item.part.Position - slimeStart).Magnitude > 6 then return "repath" end -- slime moved
+
+        local now = os.clock()
+        if now - lastCheck >= 0.6 then
+            if (r.Position - lastPos).Magnitude < 0.6 then
+                h:ChangeState(Enum.HumanoidStateType.Jumping) -- nudge over small ledges
+                if now - started > 1.8 then return "stuck" end
+            end
+            lastPos, lastCheck = r.Position, now
+        end
+        if now - started > timeout then return "stuck" end
+    end
+end
+
+-- Returns "done", "repath", "stuck", "nopath" or "stop"
+local function walkToSlime(h, r, item)
+    local goal = walkGoal(item.part, r)
+    local path = PathfindingService:CreatePath({
+        AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 4,
+    })
+    local computed = pcall(function() path:ComputeAsync(r.Position, goal) end)
+    if not computed or path.Status ~= Enum.PathStatus.Success then
+        return "nopath"
+    end
+
+    local waypoints = path:GetWaypoints()
+    local blockedAt = nil
+    local blockedConn = path.Blocked:Connect(function(idx) blockedAt = idx end)
+    local slimeStart = item.part.Position
+    local result = "done"
+
+    for i = 2, #waypoints do
+        local wp = waypoints[i]
+        if wp.Action == Enum.PathWaypointAction.Jump then
+            h:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+        local idx = i
+        local step = stepToWaypoint(h, r, item, wp, slimeStart, function()
+            return blockedAt ~= nil and blockedAt >= idx
+        end)
+        if step ~= "ok" then
+            result = step
+            break
+        end
+    end
+
+    blockedConn:Disconnect()
+    return result
+end
+
 task.spawn(function()
     local cur, curSince, curSig
+    local stuckCount = 0
 
     while S.alive do
         if not S.farming or S.pinkFarm or S.rejoining then
@@ -551,6 +656,7 @@ task.spawn(function()
             else
                 if not validTarget(cur) then
                     cur = getNearestSlime()
+                    stuckCount = 0
                     if cur then curSince, curSig = os.clock(), healthSig(cur.part) end
                 end
 
@@ -565,27 +671,46 @@ task.spawn(function()
                 end
 
                 if cur then
-                    local dest = targetPosition(cur.part)
-                    local dist = (r.Position - dest).Magnitude
-
-                    if dist > 3 then
-                        if cfg.slimeMove == "Teleport" then
-                            place(r, dest)
-                            r.AssemblyLinearVelocity = Vector3.zero
-                            task.wait(0.1)
-                        elseif cfg.slimeMove == "Tween" then
-                            tweenTo(r, cur, dest)
+                    if cfg.slimeMove == "Walk To" then
+                        local goal = walkGoal(cur.part, r)
+                        if flatDist(r.Position, goal) > 3.5 then
+                            local result = walkToSlime(h, r, cur)
+                            if result == "nopath" then
+                                blacklist[cur.part] = os.clock() + 15
+                                setStatus("No walkable path to " .. cur.inst.Name .. ", skipping it")
+                                cur = nil
+                            elseif result == "stuck" then
+                                stuckCount += 1
+                                if stuckCount >= 3 then
+                                    blacklist[cur.part] = os.clock() + 20
+                                    setStatus("Got stuck walking to " .. cur.inst.Name .. ", skipping it")
+                                    cur, stuckCount = nil, 0
+                                else
+                                    task.wait(0.2)
+                                end
+                            else
+                                stuckCount = 0
+                            end
                         else
-                            h:MoveTo(dest)
+                            h:MoveTo(r.Position) -- in range: stand still and fight
                             task.wait(0.1)
                         end
                     else
-                        if cfg.slimeMove == "Walk To" then
-                            h:MoveTo(r.Position)
+                        local dest = targetPosition(cur.part)
+                        local dist = (r.Position - dest).Magnitude
+
+                        if dist > 3 then
+                            if cfg.slimeMove == "Teleport" then
+                                place(r, dest)
+                                r.AssemblyLinearVelocity = Vector3.zero
+                                task.wait(0.1)
+                            else
+                                tweenTo(r, cur, dest)
+                            end
                         else
                             r.AssemblyLinearVelocity = Vector3.zero
+                            task.wait(0.1)
                         end
-                        task.wait(0.1)
                     end
                 else
                     task.wait(0.3)
